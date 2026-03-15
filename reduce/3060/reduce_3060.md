@@ -1,5 +1,77 @@
 # CUDA Reduce 算子优化报告 —— RTX 3060 专版
 
+## 指标说明与计算方法
+
+为避免歧义，本报告中的“带宽、占用率、延迟”等指标含义及计算方式如下（单位与口径保持一致）：
+
+**数据规模与换算口径**
+- 本报告固定数据规模：`N = 33,554,432` 个 `float32`，总输入字节数 `Bytes = N * 4 = 134,217,728 B`。
+- 带宽统一使用十进制 GB（`1 GB = 10^9 B`），与 NCU 的带宽口径保持一致。
+
+**表 2「性能基准测试结果」中的指标**
+- `时间(μs)`：单次 kernel 平均耗时（预热 10 次后，计时 100 次取平均）。
+- `带宽(GB/s)`：仅按输入读取字节数计算的“有效读带宽”，公式：
+  `BW = Bytes / Time / 1e9`。  
+  例如 v0：`134,217,728 B / 0.001837 s / 1e9 ≈ 73 GB/s`。
+- `带宽利用率`：相对理论显存带宽的利用率，公式：
+  `Util = BW / 360 GB/s`（360 GB/s 来自 3060 规格）。
+- `相对 v0 加速比`：`Speedup = Time_v0 / Time_vx`。
+
+**表 3.1「NCU 基础性能指标」中的指标（`ncu --set basic`）**
+- `Duration`：单次 kernel 的完整执行时长（含调度与执行），由 NCU 直接统计。
+- `DRAM BW(%)`：实际 DRAM 读写带宽占理论峰值的百分比（NCU 统计）。
+- `L1/TEX BW(%)`、`L2 BW(%)`：对应层级缓存带宽占峰值的百分比（NCU 统计）。
+- `Compute(%)`：SM 计算管线繁忙度（SM Throughput），为 NCU 的计算吞吐指标。
+- `Occupancy(%)`：Achieved Occupancy（实际活跃 warp 比例）。
+- `Waves/SM`：完成全网格所需的 wave 数，近似公式：
+  `Waves/SM = ceil(GridBlocks / (ActiveBlocksPerSM * SMs))`。  
+  该值越大表示需要更多轮次才能执行完所有 block。
+
+**表 3.2「NCU 详细内存与计算指标」中的指标（`ncu --metrics`）**
+- `DRAM读(MB)`：NCU 统计的 DRAM 实际读取字节数，换算为 MB（十进制）。
+- `SharedMem ST冲突` / `SharedMem LD冲突`：共享内存写/读 bank 冲突次数（NCU 统计）。
+- `活跃Warp率(%)`：Warp 活跃周期占比（Active Warp Cycles / Total Cycles）。
+- `FADD指令数`：浮点加法指令数量（NVCC 生成的实际执行指令数）。
+- `Stall-Wait(%)`：Warp 因 barrier（如 `__syncthreads()`）等待的周期占比。
+
+> 说明：NCU 中带宽与利用率均为硬件计数口径；表 2 的带宽为“应用层有效读带宽”，两者口径不同但趋势应一致。
+
+**NCU 采集命令与参数（用于本文数据）**
+- 一键采集 `basic`（表 3.1 数据来源）：
+  `make profile_all`  
+  等价命令（见 `Makefile`）：  
+  `sudo /usr/local/cuda/bin/ncu --set basic --kernel-name-base function -o profile_vX ./reduce_profile X`
+- 单版本完整报告（生成 `.ncu-rep`，供 ncu-ui 打开）：  
+  `make profile_v7`  
+  等价命令：  
+  `sudo /usr/local/cuda/bin/ncu --set full --import-source yes -o profile_v7 ./reduce_profile 7`
+- 关键内存指标（表 3.2 数据来源）：  
+  `make profile_mem_7`  
+  等价命令：  
+  `sudo /usr/local/cuda/bin/ncu --metrics <指标列表> ./reduce_profile 7`
+  指标列表（与 `Makefile` 保持一致）：
+  `l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum.per_second,`
+  `lts__t_bytes.sum.per_second,`
+  `dram__bytes_read.sum.per_second,`
+  `dram__bytes_write.sum.per_second,`
+  `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,`
+  `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum,`
+  `smsp__sass_thread_inst_executed_op_fadd_pred_on.sum,`
+  `smsp__warp_issue_stalled_branch_not_taken_per_warp_active.pct,`
+  `smsp__warp_issue_stalled_scoreboard_per_warp_active.pct,`
+  `smsp__warp_issue_stalled_wait_per_warp_active.pct,`
+  `sm__warps_active.avg.pct_of_peak_sustained_active,`
+  `sm__throughput.avg.pct_of_peak_sustained_elapsed`
+
+**参数含义**
+- `--set basic/full`：选择 NCU 预设指标集合（基础/完整）。
+- `--metrics <...>`：显式指定需要采集的指标集合（见 `Makefile` 中列表）。
+- `--kernel-name-base function`：按函数名匹配 kernel（便于脚本稳定抓取）。
+- `-o profile_vX`：输出报告前缀，生成 `profile_vX.ncu-rep`。
+- `--import-source yes`：在报告中嵌入源码，便于 ncu-ui 关联查看。
+- `./reduce_profile X`：运行指定版本（`X ∈ [0,7]`），单次 kernel 调用便于精确测量。
+- 需要 `root` 权限或将 `paranoia_level=0`（否则 NCU 无法采集部分指标）。
+
 ## 一、硬件环境
 
 | 项目 | 值 |
